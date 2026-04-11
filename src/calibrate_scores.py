@@ -23,12 +23,15 @@ from src.history_validity_gate import (
     scatter_topk_back,
     novelty_bucket_from_history,
     stale_exact_bucket,
+    find_candidate_positions,
 )
 from src.history_validity_calibration import PostHocHistoryValidityCalibrator
 
 
 def save_json(obj, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
     with open(path, "w") as f:
         json.dump(obj, f, indent=2)
 
@@ -58,13 +61,12 @@ def build_histories(data, num_rels):
     return train_hist, train_valid_hist
 
 
-def candidate_gold_positions(candidate_ids, gold_ids):
-    pos = []
-    candidate_ids_cpu = candidate_ids.detach().cpu().tolist()
-    gold_ids_cpu = gold_ids.detach().cpu().tolist()
-    for row, g in zip(candidate_ids_cpu, gold_ids_cpu):
-        pos.append(row.index(int(g)))
-    return torch.tensor(pos, dtype=torch.long, device=candidate_ids.device)
+def ensure_tensor(x, dtype, device):
+    if torch.is_tensor(x):
+        if x.device != device or x.dtype != dtype:
+            return x.to(device=device, dtype=dtype)
+        return x
+    return torch.as_tensor(x, dtype=dtype, device=device)
 
 
 def apply_calibrator_full(
@@ -75,8 +77,8 @@ def apply_calibrator_full(
     topk_cands,
     device,
 ):
-    triples_4col_t = torch.tensor(triples_4col, dtype=torch.long, device=device)
-    base_scores_t = torch.tensor(base_scores, dtype=torch.float32, device=device)
+    triples_4col_t = ensure_tensor(triples_4col, torch.long, device)
+    base_scores_t = ensure_tensor(base_scores, torch.float32, device)
 
     triples_3col = triples_4col_t[:, :3]
     rel_ids = triples_3col[:, 1]
@@ -92,6 +94,7 @@ def apply_calibrator_full(
         so_hist=histories["so"],
         ro_hist=histories["ro"],
         device=device,
+        mode=calibrator.mode,
     )
 
     adjusted_topk, hist_bias = calibrator(
@@ -103,7 +106,7 @@ def apply_calibrator_full(
     )
 
     adjusted_full = scatter_topk_back(base_scores_t, candidate_ids, adjusted_topk)
-    target_pos = candidate_gold_positions(candidate_ids, gold_ids)
+    target_pos = find_candidate_positions(candidate_ids, gold_ids)
     return adjusted_full, adjusted_topk, candidate_ids, target_pos, hist_bias, (seen_sr, dt_sr)
 
 
@@ -291,6 +294,27 @@ def evaluate_dev_mrr(
     return summary["overall_filtered"]["MRR"], summary
 
 
+def split_valid_dump_by_tail_time(valid_scores, valid_triples, valid_times, dev_frac):
+    if len(valid_times) == 1:
+        return valid_scores, valid_triples, valid_times, valid_scores, valid_triples, valid_times
+
+    dev_num_times = int(round(len(valid_times) * dev_frac))
+    dev_num_times = max(1, min(dev_num_times, len(valid_times) - 1))
+
+    train_times = valid_times[:-dev_num_times]
+    dev_times = valid_times[-dev_num_times:]
+
+    train_mask = np.isin(valid_triples[:, 3], np.asarray(train_times, dtype=np.int64))
+    dev_mask = np.isin(valid_triples[:, 3], np.asarray(dev_times, dtype=np.int64))
+
+    train_scores_np = valid_scores[train_mask]
+    train_triples_np = valid_triples[train_mask]
+    dev_scores_np = valid_scores[dev_mask]
+    dev_triples_np = valid_triples[dev_mask]
+
+    return train_scores_np, train_triples_np, train_times, dev_scores_np, dev_triples_np, dev_times
+
+
 def main():
     parser = argparse.ArgumentParser(description="Post-hoc RHVC calibrator for RE-GCN dumps")
     parser.add_argument("--dataset", type=str, required=True)
@@ -349,19 +373,9 @@ def main():
     all_ans_list_valid = utils.load_all_answers_for_time_filter(data.valid, data.num_rels, data.num_nodes, False)
     all_ans_list_test = utils.load_all_answers_for_time_filter(data.test, data.num_rels, data.num_nodes, False)
 
-    num_rows = len(valid_triples)
-    indices = np.arange(num_rows)
-    rng = np.random.default_rng(args.seed)
-    rng.shuffle(indices)
-
-    dev_size = max(1, int(round(num_rows * args.dev_frac)))
-    dev_idx = np.sort(indices[:dev_size])
-    train_idx = np.sort(indices[dev_size:])
-
-    train_scores_np = valid_scores[train_idx]
-    train_triples_np = valid_triples[train_idx]
-    dev_scores_np = valid_scores[dev_idx]
-    dev_triples_np = valid_triples[dev_idx]
+    train_scores_np, train_triples_np, train_times, dev_scores_np, dev_triples_np, dev_times = split_valid_dump_by_tail_time(
+        valid_scores, valid_triples, valid_times, args.dev_frac
+    )
 
     calibrator = PostHocHistoryValidityCalibrator(
         num_relations=num_rels * 2,
@@ -421,12 +435,12 @@ def main():
             reg_vals.append(float(reg_loss.item()))
 
         calibrator.eval()
-        dev_mrr, dev_summary = evaluate_dev_mrr(
+        dev_mrr, _ = evaluate_dev_mrr(
             calibrator,
             dev_scores_np,
             dev_triples_np,
-            valid_times,
-            all_ans_list_valid,
+            dev_times,
+            all_ans_list_valid[-len(dev_times):],
             train_hist,
             device,
             args.eval_topk_cands,
@@ -447,7 +461,14 @@ def main():
             best_epoch = epoch
             patience_left = args.patience
             row["is_best"] = True
-            torch.save({"state_dict": calibrator.state_dict(), "epoch": epoch, "best_dev_mrr": best_dev_mrr}, best_state_path)
+            torch.save(
+                {
+                    "state_dict": calibrator.state_dict(),
+                    "epoch": epoch,
+                    "best_dev_mrr": best_dev_mrr,
+                },
+                best_state_path,
+            )
         else:
             if epoch + 1 >= args.min_epochs:
                 patience_left -= 1
@@ -490,6 +511,11 @@ def main():
             "best_dev_mrr": float(best_dev_mrr),
             "history": history_rows,
             "checkpoint_path": best_state_path,
+            "dev_split": {
+                "mode": "tail_time",
+                "train_times": train_times,
+                "dev_times": dev_times,
+            },
         },
         "valid_full": valid_full,
         "test_full": test_full,
@@ -499,12 +525,17 @@ def main():
     }
 
     save_json(results, os.path.join(args.out_dir, "results_full.json"))
-    print(json.dumps({
-        "best_epoch": best_epoch,
-        "best_dev_mrr": best_dev_mrr,
-        "test_mrr": results["overall_filtered"]["MRR"],
-        "test_stale_top1_rate": results["stale_top1_interference"]["stale_top1_rate"],
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "best_epoch": best_epoch,
+                "best_dev_mrr": best_dev_mrr,
+                "test_mrr": results["overall_filtered"]["MRR"],
+                "test_stale_top1_rate": results["stale_top1_interference"]["stale_top1_rate"],
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
