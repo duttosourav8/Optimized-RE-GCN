@@ -3,7 +3,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 from rgcn.layers import UnionRGCNLayer, RGCNBlockLayer
 from src.model import BaseRGCN
@@ -38,8 +37,7 @@ class RGCNCell(BaseRGCN):
                 skip_connect=sc,
                 rel_emb=self.rel_emb,
             )
-        else:
-            raise NotImplementedError
+        raise NotImplementedError
 
     def forward(self, g, init_ent_emb, init_rel_emb):
         if self.encoder_name == "uvrgcn":
@@ -49,20 +47,20 @@ class RGCNCell(BaseRGCN):
             for i, layer in enumerate(self.layers):
                 layer(g, [], r[i])
             return g.ndata.pop("h")
+
+        if self.features is not None:
+            print("----------------Feature is not None, Attention ------------")
+            g.ndata["id"] = self.features
+        node_id = g.ndata["id"].squeeze()
+        g.ndata["h"] = init_ent_emb[node_id]
+        if self.skip_connect:
+            prev_h = []
+            for layer in self.layers:
+                prev_h = layer(g, prev_h)
         else:
-            if self.features is not None:
-                print("----------------Feature is not None, Attention ------------")
-                g.ndata["id"] = self.features
-            node_id = g.ndata["id"].squeeze()
-            g.ndata["h"] = init_ent_emb[node_id]
-            if self.skip_connect:
-                prev_h = []
-                for layer in self.layers:
-                    prev_h = layer(g, prev_h)
-            else:
-                for layer in self.layers:
-                    layer(g, [])
-            return g.ndata.pop("h")
+            for layer in self.layers:
+                layer(g, [])
+        return g.ndata.pop("h")
 
 
 class RecurrentRGCN(nn.Module):
@@ -233,24 +231,19 @@ class RecurrentRGCN(nn.Module):
         for i, g in enumerate(g_list):
             g = g.to(self.gpu)
             temp_e = self.h[g.r_to_e]
-            x_input = (
-                torch.zeros(self.num_rels * 2, self.h_dim).float().cuda()
-                if use_cuda
-                else torch.zeros(self.num_rels * 2, self.h_dim).float()
-            )
+            x_input = self.h.new_zeros((self.num_rels * 2, self.h_dim))
+
             for span, r_idx in zip(g.r_len, g.uniq_r):
-                x = temp_e[span[0] : span[1], :]
+                x = temp_e[span[0]: span[1], :]
                 x_mean = torch.mean(x, dim=0, keepdim=True)
                 x_input[r_idx] = x_mean
 
+            x_input = torch.cat((self.emb_rel, x_input), dim=1)
             if i == 0:
-                x_input = torch.cat((self.emb_rel, x_input), dim=1)
                 self.h_0 = self.relation_cell_1(x_input, self.emb_rel)
-                self.h_0 = F.normalize(self.h_0) if self.layer_norm else self.h_0
             else:
-                x_input = torch.cat((self.emb_rel, x_input), dim=1)
                 self.h_0 = self.relation_cell_1(x_input, self.h_0)
-                self.h_0 = F.normalize(self.h_0) if self.layer_norm else self.h_0
+            self.h_0 = F.normalize(self.h_0) if self.layer_norm else self.h_0
 
             current_h = self.rgcn.forward(g, self.h, [self.h_0, self.h_0])
             current_h = F.normalize(current_h) if self.layer_norm else current_h
@@ -261,7 +254,12 @@ class RecurrentRGCN(nn.Module):
         return history_embs, static_emb, self.h_0, gate_list, degree_list
 
     def _apply_history_validity_adapter(self, entity_logits, all_triples, current_time, hva_histories):
-        if (not self.use_history_gate) or (self.history_validity_adapter is None) or (hva_histories is None) or (current_time is None):
+        if (
+            (not self.use_history_gate)
+            or (self.history_validity_adapter is None)
+            or (hva_histories is None)
+            or (current_time is None)
+        ):
             return entity_logits
 
         time_col = torch.full(
@@ -283,6 +281,7 @@ class RecurrentRGCN(nn.Module):
             so_hist=hva_histories["so"],
             ro_hist=hva_histories["ro"],
             device=entity_logits.device,
+            mode=self.hva_mode,
         )
 
         rel_ids = all_triples[:, 1]
@@ -313,13 +312,16 @@ class RecurrentRGCN(nn.Module):
             return all_triples, score, score_rel
 
     def get_loss(self, glist, triples, static_graph, use_cuda, current_time=None, hva_histories=None):
-        loss_ent = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-        loss_rel = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-        loss_static = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
+        device = torch.device(f"cuda:{self.gpu}") if use_cuda else triples.device
+        loss_ent = torch.zeros(1, device=device)
+        loss_rel = torch.zeros(1, device=device)
+        loss_static = torch.zeros(1, device=device)
 
         inverse_triples = triples[:, [2, 1, 0]]
         inverse_triples[:, 1] = inverse_triples[:, 1] + self.num_rels
-        all_triples = torch.cat([triples, inverse_triples]).to(self.gpu)
+        all_triples = torch.cat([triples, inverse_triples])
+        if use_cuda:
+            all_triples = all_triples.cuda(self.gpu)
 
         evolve_embs, static_emb, r_emb, _, _ = self.forward(glist, static_graph, use_cuda)
         pre_emb = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
