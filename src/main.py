@@ -67,10 +67,20 @@ def build_hva_histories(data, num_rels):
     return train_hist, train_valid_hist
 
 
+def build_graph_cache(snapshot_list, num_nodes, num_rels, gpu):
+    """
+    Cache temporal graphs once on CPU.
+    This preserves baseline semantics while removing repeated graph construction.
+    """
+    return [build_sub_graph(num_nodes, num_rels, snap, False, gpu) for snap in snapshot_list]
+
+
 def test(
     model,
     history_list,
+    history_graph_list,
     test_list,
+    test_graph_list,
     time_list,
     num_rels,
     num_nodes,
@@ -98,30 +108,30 @@ def test(
         model.load_state_dict(checkpoint["state_dict"])
 
     model.eval()
-    input_list = [snap for snap in history_list[-args.test_history_len:]]
+    input_snap_list = [snap for snap in history_list[-args.test_history_len:]]
+    input_graphs = [g for g in history_graph_list[-args.test_history_len:]]
 
-    for time_idx, test_snap in enumerate(tqdm(test_list)):
-        current_time = int(time_list[time_idx])
-
-        history_glist = [build_sub_graph(num_nodes, num_rels, g, use_cuda, args.gpu) for g in input_list]
+    for time_idx, (test_snap, test_graph, current_time) in enumerate(
+        tqdm(list(zip(test_list, test_graph_list, time_list)), total=len(test_list))
+    ):
         test_triples_input = torch.LongTensor(test_snap)
         if use_cuda:
             test_triples_input = test_triples_input.cuda(args.gpu)
 
         test_triples, final_score, final_r_score = model.predict(
-            history_glist,
+            input_graphs,
             num_rels,
             static_graph,
             test_triples_input,
             use_cuda,
-            current_time=current_time,
+            current_time=int(current_time),
             hva_histories=hva_histories,
         )
 
         if args.dump_full_scores:
             time_col = torch.full(
                 (test_triples.size(0), 1),
-                current_time,
+                int(current_time),
                 dtype=torch.long,
                 device=test_triples.device,
             )
@@ -146,12 +156,18 @@ def test(
                 predicted_snap = utils.construct_snap(test_triples, num_nodes, num_rels, final_score, args.topk)
             else:
                 predicted_snap = utils.construct_snap_r(test_triples, num_nodes, num_rels, final_r_score, args.topk)
+
             if len(predicted_snap):
-                input_list.pop(0)
-                input_list.append(predicted_snap)
+                predicted_graph = build_sub_graph(num_nodes, num_rels, predicted_snap, False, args.gpu)
+                input_snap_list.pop(0)
+                input_snap_list.append(predicted_snap)
+                input_graphs.pop(0)
+                input_graphs.append(predicted_graph)
         else:
-            input_list.pop(0)
-            input_list.append(test_snap)
+            input_snap_list.pop(0)
+            input_snap_list.append(test_snap)
+            input_graphs.pop(0)
+            input_graphs.append(test_graph)
 
     mrr_raw = utils.stat_ranks(ranks_raw, "raw_ent")
     mrr_filter = utils.stat_ranks(ranks_filter, "filter_ent")
@@ -226,17 +242,20 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
     print("Sanity Check: Is cuda available ? {}".format(torch.cuda.is_available()))
     use_cuda = args.gpu >= 0 and torch.cuda.is_available()
 
+    print("building cached temporal graphs on CPU ...")
+    train_graphs = build_graph_cache(train_list, num_nodes, num_rels, args.gpu)
+    valid_graphs = build_graph_cache(valid_list, num_nodes, num_rels, args.gpu)
+    test_graphs = build_graph_cache(test_list, num_nodes, num_rels, args.gpu)
+
     static_graph = None
     if args.add_static_graph:
-        static_triples = np.array(_read_triplets_as_list("../data/" + args.dataset + "/e-w-graph.txt", {}, {}, load_time=False))
+        static_triples = np.array(
+            _read_triplets_as_list("../data/" + args.dataset + "/e-w-graph.txt", {}, {}, load_time=False)
+        )
         num_static_rels = len(np.unique(static_triples[:, 1]))
         num_words = len(np.unique(static_triples[:, 2]))
         static_triples[:, 2] = static_triples[:, 2] + num_nodes
-        static_node_id = (
-            torch.from_numpy(np.arange(num_words + data.num_nodes)).view(-1, 1).long().cuda(args.gpu)
-            if use_cuda else
-            torch.from_numpy(np.arange(num_words + data.num_nodes)).view(-1, 1).long()
-        )
+        static_node_id = torch.from_numpy(np.arange(num_words + data.num_nodes)).view(-1, 1).long()
         static_graph = build_sub_graph(len(static_node_id), num_static_rels, static_triples, use_cuda, args.gpu)
     else:
         num_static_rels, num_words = 0, 0
@@ -322,7 +341,9 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
         return test(
             model,
             train_list,
+            train_graphs,
             valid_list,
+            valid_graphs,
             valid_times,
             num_rels,
             num_nodes,
@@ -340,7 +361,9 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
         return test(
             model,
             train_list + valid_list,
+            train_graphs + valid_graphs,
             test_list,
+            test_graphs,
             test_times,
             num_rels,
             num_nodes,
@@ -358,7 +381,9 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
         return test(
             model,
             train_list + valid_list,
+            train_graphs + valid_graphs,
             test_list,
+            test_graphs,
             test_times,
             num_rels,
             num_nodes,
@@ -384,15 +409,16 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
             if train_sample_num == 0:
                 continue
 
-            output = train_list[train_sample_num:train_sample_num + 1]
+            output = train_list[train_sample_num: train_sample_num + 1]
             current_time = int(train_times[train_sample_num])
 
             if train_sample_num - args.train_history_len < 0:
-                input_list = train_list[0: train_sample_num]
+                start_idx = 0
             else:
-                input_list = train_list[train_sample_num - args.train_history_len: train_sample_num]
+                start_idx = train_sample_num - args.train_history_len
 
-            history_glist = [build_sub_graph(num_nodes, num_rels, snap, use_cuda, args.gpu) for snap in input_list]
+            history_glist = train_graphs[start_idx:train_sample_num]
+
             if use_cuda:
                 output = [torch.from_numpy(_).long().cuda(args.gpu) for _ in output]
             else:
@@ -445,7 +471,9 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
             _, mrr_filter, _, mrr_filter_r = test(
                 model,
                 train_list,
+                train_graphs,
                 valid_list,
+                valid_graphs,
                 valid_times,
                 num_rels,
                 num_nodes,
@@ -514,7 +542,9 @@ def run_experiment(args, n_hidden=None, n_layers=None, dropout=None, n_bases=Non
     return test(
         model,
         train_list + valid_list,
+        train_graphs + valid_graphs,
         test_list,
+        test_graphs,
         test_times,
         num_rels,
         num_nodes,
@@ -636,7 +666,9 @@ if __name__ == "__main__":
             print(grid_entry)
             o_f.write("\t".join([str(_) for _ in grid_entry]) + "\n")
 
-            mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r = run_experiment(args, grid_entry[0], grid_entry[1], grid_entry[2], grid_entry[3])
+            mrr_raw, mrr_filter, mrr_raw_r, mrr_filter_r = run_experiment(
+                args, grid_entry[0], grid_entry[1], grid_entry[2], grid_entry[3]
+            )
             print("MRR raw/filter: {:.6f} / {:.6f}".format(mrr_raw, mrr_filter))
             o_f.write("MRR raw/filter: {:.6f} / {:.6f}\n".format(mrr_raw, mrr_filter))
             o_f.close()
