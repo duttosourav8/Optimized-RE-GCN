@@ -253,7 +253,14 @@ class RecurrentRGCN(nn.Module):
 
         return history_embs, static_emb, self.h_0, gate_list, degree_list
 
-    def _apply_history_validity_adapter(self, entity_logits, all_triples, current_time, hva_histories):
+    def _apply_history_validity_adapter(
+        self,
+        entity_logits,
+        all_triples,
+        current_time,
+        hva_histories,
+    ):
+        """Apply HVA without using the hidden target entity."""
         if (
             (not self.use_history_gate)
             or (self.history_validity_adapter is None)
@@ -262,39 +269,79 @@ class RecurrentRGCN(nn.Module):
         ):
             return entity_logits
 
-        time_col = torch.full(
-            (all_triples.size(0), 1),
-            int(current_time),
-            dtype=torch.long,
-            device=all_triples.device,
-        )
-        query_triples = torch.cat([all_triples, time_col], dim=1)
-
-        gold_ids = all_triples[:, 2]
-        candidate_ids = build_topk_candidate_ids(entity_logits, gold_ids, self.hva_topk)
-        base_scores_topk = torch.gather(entity_logits, 1, candidate_ids)
-
-        seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro = build_topk_history_features_dual(
-            query_triples=query_triples,
-            candidate_ids=candidate_ids,
-            sr_hist=hva_histories["sr"],
-            so_hist=hva_histories["so"],
-            ro_hist=hva_histories["ro"],
-            device=entity_logits.device,
-            mode=self.hva_mode,
-        )
-
         rel_ids = all_triples[:, 1]
+
+        # Candidate selection and history lookup are discrete operations.
+        # Keep only these operations under no_grad. The learnable adapter
+        # remains outside so it receives gradients during training.
+        with torch.no_grad():
+            candidate_ids = build_topk_candidate_ids(
+                entity_logits,
+                self.hva_topk,
+            )
+
+            time_col = torch.full(
+                (all_triples.size(0), 1),
+                int(current_time),
+                dtype=torch.long,
+                device=all_triples.device,
+            )
+            query_triples = torch.cat(
+                [all_triples, time_col],
+                dim=1,
+            )
+
+            # Defence in depth: the true target object must not be available
+            # to history feature construction.
+            query_triples = query_triples.clone()
+            query_triples[:, 2] = -1
+
+            (
+                seen_sr,
+                dt_sr,
+                freq_sr,
+                seen_so,
+                dt_so,
+                freq_so,
+                seen_ro,
+                dt_ro,
+                freq_ro,
+            ) = build_topk_history_features_dual(
+                query_triples=query_triples,
+                candidate_ids=candidate_ids,
+                sr_hist=hva_histories["sr"],
+                so_hist=hva_histories["so"],
+                ro_hist=hva_histories["ro"],
+                device=entity_logits.device,
+                mode=self.hva_mode,
+            )
+
+        base_scores_topk = torch.gather(
+            entity_logits,
+            dim=1,
+            index=candidate_ids,
+        )
+
         adjusted_topk_scores, _ = self.history_validity_adapter(
             base_scores_topk,
             rel_ids,
-            seen_sr, dt_sr, freq_sr,
-            seen_so, dt_so, freq_so,
-            seen_ro, dt_ro, freq_ro,
+            seen_sr,
+            dt_sr,
+            freq_sr,
+            seen_so,
+            dt_so,
+            freq_so,
+            seen_ro,
+            dt_ro,
+            freq_ro,
         )
 
-        adjusted_scores = scatter_topk_back(entity_logits, candidate_ids, adjusted_topk_scores)
-        return adjusted_scores
+        return scatter_topk_back(
+            entity_logits,
+            candidate_ids,
+            adjusted_topk_scores,
+        )
+
 
     def predict(self, test_graph, num_rels, static_graph, test_triplets, use_cuda, current_time=None, hva_histories=None):
         with torch.no_grad():

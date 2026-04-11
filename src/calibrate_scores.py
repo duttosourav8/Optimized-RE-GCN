@@ -23,7 +23,6 @@ from src.history_validity_gate import (
     scatter_topk_back,
     novelty_bucket_from_history,
     stale_exact_bucket,
-    find_candidate_positions,
 )
 from src.history_validity_calibration import PostHocHistoryValidityCalibrator
 
@@ -77,18 +76,52 @@ def apply_calibrator_full(
     topk_cands,
     device,
 ):
-    triples_4col_t = ensure_tensor(triples_4col, torch.long, device)
-    base_scores_t = ensure_tensor(base_scores, torch.float32, device)
+    """Apply RHVC using score-only candidates.
 
-    triples_3col = triples_4col_t[:, :3]
-    rel_ids = triples_3col[:, 1]
-    gold_ids = triples_3col[:, 2]
+    The hidden target entity is never used to choose which candidates receive
+    calibration. The object column is masked before history feature creation.
+    """
+    triples_4col_t = ensure_tensor(
+        triples_4col,
+        torch.long,
+        device,
+    )
+    base_scores_t = ensure_tensor(
+        base_scores,
+        torch.float32,
+        device,
+    )
 
-    candidate_ids = build_topk_candidate_ids(base_scores_t, gold_ids, topk_cands)
-    base_topk = torch.gather(base_scores_t, 1, candidate_ids)
+    rel_ids = triples_4col_t[:, 1]
 
-    seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro = build_topk_history_features_dual(
-        query_triples=triples_4col_t,
+    # Leakage-safe: candidate membership depends only on model scores.
+    candidate_ids = build_topk_candidate_ids(
+        base_scores_t,
+        topk_cands,
+    )
+
+    base_topk = torch.gather(
+        base_scores_t,
+        dim=1,
+        index=candidate_ids,
+    )
+
+    # Defence in depth: history feature construction must not read the target.
+    feature_queries = triples_4col_t.clone()
+    feature_queries[:, 2] = -1
+
+    (
+        seen_sr,
+        dt_sr,
+        freq_sr,
+        seen_so,
+        dt_so,
+        freq_so,
+        seen_ro,
+        dt_ro,
+        freq_ro,
+    ) = build_topk_history_features_dual(
+        query_triples=feature_queries,
         candidate_ids=candidate_ids,
         sr_hist=histories["sr"],
         so_hist=histories["so"],
@@ -100,14 +133,30 @@ def apply_calibrator_full(
     adjusted_topk, hist_bias = calibrator(
         base_topk,
         rel_ids,
-        seen_sr, dt_sr, freq_sr,
-        seen_so, dt_so, freq_so,
-        seen_ro, dt_ro, freq_ro,
+        seen_sr,
+        dt_sr,
+        freq_sr,
+        seen_so,
+        dt_so,
+        freq_so,
+        seen_ro,
+        dt_ro,
+        freq_ro,
     )
 
-    adjusted_full = scatter_topk_back(base_scores_t, candidate_ids, adjusted_topk)
-    target_pos = find_candidate_positions(candidate_ids, gold_ids)
-    return adjusted_full, adjusted_topk, candidate_ids, target_pos, hist_bias, (seen_sr, dt_sr)
+    adjusted_full = scatter_topk_back(
+        base_scores_t,
+        candidate_ids,
+        adjusted_topk,
+    )
+
+    return (
+        adjusted_full,
+        adjusted_topk,
+        candidate_ids,
+        hist_bias,
+        (seen_sr, dt_sr),
+    )
 
 
 def compute_batch_loss(
@@ -118,7 +167,14 @@ def compute_batch_loss(
     args,
     device,
 ):
-    adjusted_full, adjusted_topk, candidate_ids, target_pos, hist_bias, aux = apply_calibrator_full(
+    """Train RHVC without forcing the gold entity into top-k."""
+    (
+        adjusted_full,
+        adjusted_topk,
+        candidate_ids,
+        hist_bias,
+        aux,
+    ) = apply_calibrator_full(
         calibrator,
         base_scores_batch,
         triples_batch,
@@ -127,26 +183,73 @@ def compute_batch_loss(
         device,
     )
 
-    ce_loss = F.cross_entropy(adjusted_topk, target_pos)
+    gold_ids = triples_batch[:, 2].to(
+        device=device,
+        dtype=torch.long,
+    )
+
+    # Full-entity supervision preserves the target label without exposing it to
+    # top-k candidate selection.
+    ce_loss = F.cross_entropy(
+        adjusted_full,
+        gold_ids,
+    )
 
     seen_sr, dt_sr = aux
-    pairwise_loss = torch.tensor(0.0, device=device)
+    pairwise_loss = torch.tensor(
+        0.0,
+        device=device,
+    )
+
     if args.pairwise_weight > 0:
-        stale_mask = (seen_sr > 0) & (dt_sr > 10)
-        stale_mask = stale_mask & (candidate_ids != triples_batch[:, 2:3])
+        stale_mask = (
+            (seen_sr > 0)
+            & (dt_sr > 10)
+            & (candidate_ids != gold_ids.unsqueeze(1))
+        )
+
         if stale_mask.any():
-            stale_scores = adjusted_topk.masked_fill(~stale_mask, -1e9)
+            stale_scores = adjusted_topk.masked_fill(
+                ~stale_mask,
+                -1e9,
+            )
             stale_idx = stale_scores.argmax(dim=1)
             valid_rows = stale_scores.max(dim=1).values > -1e8
+
             if valid_rows.any():
-                row_ids = torch.arange(adjusted_topk.size(0), device=device)[valid_rows]
-                gold_logits = adjusted_topk[row_ids, target_pos[valid_rows]]
-                stale_logits = adjusted_topk[row_ids, stale_idx[valid_rows]]
-                pairwise_loss = F.relu(args.margin - (gold_logits - stale_logits)).mean()
+                row_ids = torch.arange(
+                    adjusted_full.size(0),
+                    device=device,
+                )[valid_rows]
+
+                gold_logits = adjusted_full[
+                    row_ids,
+                    gold_ids[valid_rows],
+                ]
+                stale_logits = adjusted_topk[
+                    row_ids,
+                    stale_idx[valid_rows],
+                ]
+
+                pairwise_loss = F.relu(
+                    args.margin
+                    - (gold_logits - stale_logits)
+                ).mean()
 
     bias_reg = hist_bias.pow(2).mean()
-    total = ce_loss + args.pairwise_weight * pairwise_loss + args.bias_reg * bias_reg
-    return total, ce_loss.detach(), pairwise_loss.detach(), bias_reg.detach()
+
+    total = (
+        ce_loss
+        + args.pairwise_weight * pairwise_loss
+        + args.bias_reg * bias_reg
+    )
+
+    return (
+        total,
+        ce_loss.detach(),
+        pairwise_loss.detach(),
+        bias_reg.detach(),
+    )
 
 
 def get_unique_times(array_like):
@@ -172,6 +275,7 @@ def finalize_stats(stats):
     return out
 
 
+@torch.no_grad()
 def analyze_adjusted_dump(
     calibrator,
     scores_np,
@@ -182,19 +286,50 @@ def analyze_adjusted_dump(
     device,
     topk_cands,
 ):
-    overall = {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0}
+    """Evaluate calibrated scores without contaminating raw predictions."""
+    overall = {
+        "MRR": 0.0,
+        "Hits@1": 0.0,
+        "Hits@3": 0.0,
+        "Hits@10": 0.0,
+        "count": 0,
+    }
     bucket_stats = {
-        "repeat": {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0},
-        "near_repeat": {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0},
-        "novel": {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0},
+        "repeat": {
+            "MRR": 0.0,
+            "Hits@1": 0.0,
+            "Hits@3": 0.0,
+            "Hits@10": 0.0,
+            "count": 0,
+        },
+        "near_repeat": {
+            "MRR": 0.0,
+            "Hits@1": 0.0,
+            "Hits@3": 0.0,
+            "Hits@10": 0.0,
+            "count": 0,
+        },
+        "novel": {
+            "MRR": 0.0,
+            "Hits@1": 0.0,
+            "Hits@3": 0.0,
+            "Hits@10": 0.0,
+            "count": 0,
+        },
     }
     stale_total = 0
     stale_count = 0
 
-    unique_dump_times = [int(x) for x in sorted(np.unique(triples_np[:, 3]).tolist())]
+    unique_dump_times = [
+        int(x)
+        for x in sorted(
+            np.unique(triples_np[:, 3]).tolist()
+        )
+    ]
     assert unique_dump_times == [int(x) for x in time_list], (
-        f"Dump times do not match expected split times.\n"
-        f"dump={unique_dump_times[:5]}... expected={time_list[:5]}..."
+        "Dump times do not match expected split times.\n"
+        f"dump={unique_dump_times[:5]}... "
+        f"expected={time_list[:5]}..."
     )
 
     for time_idx, t in enumerate(time_list):
@@ -202,7 +337,13 @@ def analyze_adjusted_dump(
         snap_scores_np = scores_np[mask]
         snap_triples_np = triples_np[mask]
 
-        adjusted_full, _, _, _, _, _ = apply_calibrator_full(
+        (
+            adjusted_full,
+            _,
+            _,
+            _,
+            _,
+        ) = apply_calibrator_full(
             calibrator,
             snap_scores_np,
             snap_triples_np,
@@ -211,24 +352,49 @@ def analyze_adjusted_dump(
             device,
         )
 
-        snap_triples_3 = torch.tensor(snap_triples_np[:, :3], dtype=torch.long, device=device)
+        snap_triples_3 = torch.tensor(
+            snap_triples_np[:, :3],
+            dtype=torch.long,
+            device=device,
+        )
+
+        # Top-1 diagnostics must use unfiltered predictions.
+        top1 = adjusted_full.argmax(dim=1)
+
+        # Filtered ranking is metric-only. Pass a clone so a filtering utility
+        # cannot modify adjusted_full in place.
         _, _, _, rank_filter = utils.get_total_rank(
             snap_triples_3,
-            adjusted_full,
+            adjusted_full.clone(),
             all_ans_list[time_idx],
             eval_bz=1000,
             rel_predict=0,
         )
 
-        top1 = adjusted_full.argmax(dim=1)
-
         for i in range(adjusted_full.size(0)):
-            s, r, o, cur_t = map(int, snap_triples_np[i])
+            s, r, o, cur_t = map(
+                int,
+                snap_triples_np[i],
+            )
             rank = int(rank_filter[i].item())
             pred_o = int(top1[i].item())
 
-            bucket = novelty_bucket_from_history(s, r, o, cur_t, histories["sr"], histories["so"], histories["ro"])
-            pred_stale_bucket = stale_exact_bucket(s, r, pred_o, cur_t, histories["sr"])
+            bucket = novelty_bucket_from_history(
+                s,
+                r,
+                o,
+                cur_t,
+                histories["sr"],
+                histories["so"],
+                histories["ro"],
+            )
+            pred_stale_bucket = stale_exact_bucket(
+                s,
+                r,
+                pred_o,
+                cur_t,
+                histories["sr"],
+            )
 
             mrr = 1.0 / rank
             h1 = 1.0 if rank <= 1 else 0.0
@@ -254,19 +420,36 @@ def analyze_adjusted_dump(
 
     overall_out = {
         "count": int(overall["count"]),
-        "MRR": safe_div(overall["MRR"], overall["count"]),
-        "Hits@1": safe_div(overall["Hits@1"], overall["count"]),
-        "Hits@3": safe_div(overall["Hits@3"], overall["count"]),
-        "Hits@10": safe_div(overall["Hits@10"], overall["count"]),
+        "MRR": safe_div(
+            overall["MRR"],
+            overall["count"],
+        ),
+        "Hits@1": safe_div(
+            overall["Hits@1"],
+            overall["count"],
+        ),
+        "Hits@3": safe_div(
+            overall["Hits@3"],
+            overall["count"],
+        ),
+        "Hits@10": safe_div(
+            overall["Hits@10"],
+            overall["count"],
+        ),
     }
 
     return {
         "overall_filtered": overall_out,
-        "bucket_metrics_filtered": finalize_stats(bucket_stats),
+        "bucket_metrics_filtered": finalize_stats(
+            bucket_stats
+        ),
         "stale_top1_interference": {
             "count": int(stale_total),
             "stale_top1_count": int(stale_count),
-            "stale_top1_rate": safe_div(stale_count, stale_total),
+            "stale_top1_rate": safe_div(
+                stale_count,
+                stale_total,
+            ),
         },
     }
 
@@ -294,25 +477,65 @@ def evaluate_dev_mrr(
     return summary["overall_filtered"]["MRR"], summary
 
 
-def split_valid_dump_by_tail_time(valid_scores, valid_triples, valid_times, dev_frac):
-    if len(valid_times) == 1:
-        return valid_scores, valid_triples, valid_times, valid_scores, valid_triples, valid_times
+def split_valid_dump_by_tail_time(
+    valid_scores,
+    valid_triples,
+    valid_times,
+    dev_frac,
+):
+    """Create disjoint temporal calibration-train and validation-dev splits."""
+    if len(valid_times) < 2:
+        raise ValueError(
+            "At least two validation timestamps are required "
+            "for disjoint calibration-train and validation-dev splits."
+        )
 
-    dev_num_times = int(round(len(valid_times) * dev_frac))
-    dev_num_times = max(1, min(dev_num_times, len(valid_times) - 1))
+    if not 0.0 < dev_frac < 1.0:
+        raise ValueError(
+            f"dev_frac must be between 0 and 1, got {dev_frac}"
+        )
+
+    dev_num_times = int(
+        round(len(valid_times) * dev_frac)
+    )
+    dev_num_times = max(
+        1,
+        min(
+            dev_num_times,
+            len(valid_times) - 1,
+        ),
+    )
 
     train_times = valid_times[:-dev_num_times]
     dev_times = valid_times[-dev_num_times:]
 
-    train_mask = np.isin(valid_triples[:, 3], np.asarray(train_times, dtype=np.int64))
-    dev_mask = np.isin(valid_triples[:, 3], np.asarray(dev_times, dtype=np.int64))
+    train_mask = np.isin(
+        valid_triples[:, 3],
+        np.asarray(train_times, dtype=np.int64),
+    )
+    dev_mask = np.isin(
+        valid_triples[:, 3],
+        np.asarray(dev_times, dtype=np.int64),
+    )
+
+    if np.any(train_mask & dev_mask):
+        raise RuntimeError(
+            "Calibration-train and validation-dev rows overlap."
+        )
 
     train_scores_np = valid_scores[train_mask]
     train_triples_np = valid_triples[train_mask]
     dev_scores_np = valid_scores[dev_mask]
     dev_triples_np = valid_triples[dev_mask]
 
-    return train_scores_np, train_triples_np, train_times, dev_scores_np, dev_triples_np, dev_times
+    return (
+        train_scores_np,
+        train_triples_np,
+        train_times,
+        dev_scores_np,
+        dev_triples_np,
+        dev_times,
+    )
 
 
 def main():
@@ -482,6 +705,17 @@ def main():
     calibrator.load_state_dict(checkpoint["state_dict"])
     calibrator.eval()
 
+    dev_full = analyze_adjusted_dump(
+        calibrator,
+        dev_scores_np,
+        dev_triples_np,
+        dev_times,
+        all_ans_list_valid[-len(dev_times):],
+        train_hist,
+        device,
+        args.eval_topk_cands,
+    )
+
     valid_full = analyze_adjusted_dump(
         calibrator,
         valid_scores,
@@ -517,6 +751,12 @@ def main():
                 "dev_times": dev_times,
             },
         },
+        "validation_protocol": {
+            "selection_split": "held-out validation-dev",
+            "full_validation_contains_calibrator_training_rows": True,
+            "full_validation_metrics_are_diagnostic_only": True,
+        },
+        "dev_full": dev_full,
         "valid_full": valid_full,
         "test_full": test_full,
         "overall_filtered": test_full["overall_filtered"],

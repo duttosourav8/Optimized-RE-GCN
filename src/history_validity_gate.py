@@ -65,25 +65,36 @@ def freq_before(times: List[int], t: int) -> int:
     return bisect.bisect_left(times, t)
 
 
-def build_topk_candidate_ids(base_scores: torch.Tensor, gold_ids: torch.Tensor, topk_cands: int) -> torch.Tensor:
-    k = min(topk_cands, base_scores.size(1))
-    topk_ids = torch.topk(base_scores, k=k, dim=1).indices
+def build_topk_candidate_ids(
+    base_scores: torch.Tensor,
+    topk_cands: int,
+) -> torch.Tensor:
+    """Select candidates using model scores only.
 
-    # Ensure gold is present without Python row loops.
-    gold_ids = gold_ids.view(-1, 1)
-    has_gold = topk_ids.eq(gold_ids).any(dim=1)
-    if not torch.all(has_gold):
-        topk_ids = topk_ids.clone()
-        missing_rows = (~has_gold).nonzero(as_tuple=False).view(-1)
-        topk_ids[missing_rows, -1] = gold_ids[missing_rows, 0]
-    return topk_ids
+    Candidate membership never depends on the true target entity, so this
+    function is safe for training, validation, and test-time prediction.
+    """
+    if base_scores.ndim != 2:
+        raise ValueError(
+            "base_scores must have shape [batch, num_entities], "
+            f"got {tuple(base_scores.shape)}"
+        )
 
+    if topk_cands <= 0:
+        raise ValueError(
+            f"topk_cands must be positive, got {topk_cands}"
+        )
 
-def find_candidate_positions(candidate_ids: torch.Tensor, gold_ids: torch.Tensor) -> torch.Tensor:
-    matches = candidate_ids.eq(gold_ids.view(-1, 1))
-    if not torch.all(matches.any(dim=1)):
-        raise ValueError("Gold id missing from candidate list.")
-    return matches.to(dtype=torch.long).argmax(dim=1)
+    k = min(
+        int(topk_cands),
+        int(base_scores.size(1)),
+    )
+
+    return torch.topk(
+        base_scores.detach(),
+        k=k,
+        dim=1,
+    ).indices
 
 
 def scatter_topk_back(full_scores: torch.Tensor, candidate_ids: torch.Tensor, adjusted_topk_scores: torch.Tensor):

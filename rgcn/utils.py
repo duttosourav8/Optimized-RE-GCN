@@ -35,44 +35,133 @@ def sort_and_rank_time_filter(batch_a, batch_r, score, target, total_triplets):
     return indices
 
 
-def sort_and_rank_filter(batch_a, batch_r, score, target, all_ans):
+def sort_and_rank_filter(
+    batch_a,
+    batch_r,
+    score,
+    target,
+    all_ans,
+):
+    """Compute filtered ranks without modifying the caller's score tensor."""
+    filtered_score = score.clone()
+
     for i in range(len(batch_a)):
-        ans = target[i]
-        b_multi = list(all_ans[batch_a[i].item()][batch_r[i].item()])
-        ground = score[i][ans]
-        score[i][b_multi] = 0
-        score[i][ans] = ground
-    _, indices = torch.sort(score, dim=1, descending=True)  # indices : [B, number entity]
-    indices = torch.nonzero(indices == target.view(-1, 1))  # indices : [B, 2] 第一列递增， 第二列表示对应的答案实体id在每一行的位置
-    indices = indices[:, 1].view(-1)
-    return indices
+        answer = target[i]
+        known_answers = list(
+            all_ans[
+                batch_a[i].item()
+            ][
+                batch_r[i].item()
+            ]
+        )
+
+        # Keep the current target score unchanged while filtering other
+        # correct answers for the same query.
+        target_score = filtered_score[i, answer].clone()
+
+        if known_answers:
+            answer_ids = torch.as_tensor(
+                known_answers,
+                dtype=torch.long,
+                device=filtered_score.device,
+            )
+            filtered_score[i, answer_ids] = 0
+
+        filtered_score[i, answer] = target_score
+
+    _, indices = torch.sort(
+        filtered_score,
+        dim=1,
+        descending=True,
+    )
+    indices = torch.nonzero(
+        indices == target.view(-1, 1)
+    )
+    return indices[:, 1].view(-1)
 
 
-def filter_score(test_triples, score, all_ans):
+def filter_score(
+    test_triples,
+    score,
+    all_ans,
+):
+    """Apply entity filtered evaluation to a cloned score tensor."""
+    filtered_score = score.clone()
+
     if all_ans is None:
-        return score
-    test_triples = test_triples.cpu()
-    for _, triple in enumerate(test_triples):
-        h, r, t = triple
-        ans = list(all_ans[h.item()][r.item()])
-        ans.remove(t.item())
-        ans = torch.LongTensor(ans)
-        score[_][ans] = -10000000  #
-    return score
+        return filtered_score
 
-def filter_score_r(test_triples, score, all_ans):
-    if all_ans is None:
-        return score
-    test_triples = test_triples.cpu()
-    for _, triple in enumerate(test_triples):
+    test_triples_cpu = test_triples.detach().cpu()
+
+    for row_idx, triple in enumerate(test_triples_cpu):
         h, r, t = triple
-        ans = list(all_ans[h.item()][t.item()])
-        # print(h, r, t)
-        # print(ans)
-        ans.remove(r.item())
-        ans = torch.LongTensor(ans)
-        score[_][ans] = -10000000  #
-    return score
+
+        answers = list(
+            all_ans[
+                h.item()
+            ][
+                r.item()
+            ]
+        )
+
+        # The target itself must remain available for ranking.
+        if t.item() in answers:
+            answers.remove(t.item())
+
+        if answers:
+            answer_ids = torch.as_tensor(
+                answers,
+                dtype=torch.long,
+                device=filtered_score.device,
+            )
+            filtered_score[
+                row_idx,
+                answer_ids,
+            ] = -10000000
+
+    return filtered_score
+
+
+def filter_score_r(
+    test_triples,
+    score,
+    all_ans,
+):
+    """Apply relation filtered evaluation to a cloned score tensor."""
+    filtered_score = score.clone()
+
+    if all_ans is None:
+        return filtered_score
+
+    test_triples_cpu = test_triples.detach().cpu()
+
+    for row_idx, triple in enumerate(test_triples_cpu):
+        h, r, t = triple
+
+        answers = list(
+            all_ans[
+                h.item()
+            ][
+                t.item()
+            ]
+        )
+
+        # Keep the target relation available for ranking.
+        if r.item() in answers:
+            answers.remove(r.item())
+
+        if answers:
+            answer_ids = torch.as_tensor(
+                answers,
+                dtype=torch.long,
+                device=filtered_score.device,
+            )
+            filtered_score[
+                row_idx,
+                answer_ids,
+            ] = -10000000
+
+    return filtered_score
 
 
 def r2e(triplets, num_rels):
@@ -135,37 +224,107 @@ def build_sub_graph(num_nodes, num_rels, triples, use_cuda, gpu):
         g.r_to_e = torch.from_numpy(np.array(r_to_e))
     return g
 
-def get_total_rank(test_triples, score, all_ans, eval_bz, rel_predict=0):
+def get_total_rank(
+    test_triples,
+    score,
+    all_ans,
+    eval_bz,
+    rel_predict=0,
+):
+    """Compute raw and filtered ranks without mutating model predictions."""
     num_triples = len(test_triples)
-    n_batch = (num_triples + eval_bz - 1) // eval_bz
+    n_batch = (
+        num_triples + eval_bz - 1
+    ) // eval_bz
+
     rank = []
     filter_rank = []
+
     for idx in range(n_batch):
         batch_start = idx * eval_bz
-        batch_end = min(num_triples, (idx + 1) * eval_bz)
-        triples_batch = test_triples[batch_start:batch_end, :]
-        score_batch = score[batch_start:batch_end, :]
-        if rel_predict==1:
-            target = test_triples[batch_start:batch_end, 1]
+        batch_end = min(
+            num_triples,
+            (idx + 1) * eval_bz,
+        )
+
+        triples_batch = test_triples[
+            batch_start:batch_end,
+            :
+        ]
+        score_batch = score[
+            batch_start:batch_end,
+            :
+        ]
+
+        if rel_predict == 1:
+            target = test_triples[
+                batch_start:batch_end,
+                1,
+            ]
         elif rel_predict == 2:
-            target = test_triples[batch_start:batch_end, 0]
+            target = test_triples[
+                batch_start:batch_end,
+                0,
+            ]
         else:
-            target = test_triples[batch_start:batch_end, 2]
-        rank.append(sort_and_rank(score_batch, target))
+            target = test_triples[
+                batch_start:batch_end,
+                2,
+            ]
+
+        # Raw rank uses the untouched model scores.
+        rank.append(
+            sort_and_rank(
+                score_batch,
+                target,
+            )
+        )
+
+        # Filtered ranking must operate on a separate tensor. This prevents
+        # current ground-truth answer filtering from changing scores later used
+        # by multi-step/autoregressive snapshot construction.
+        filter_input = score_batch.clone()
 
         if rel_predict:
-            filter_score_batch = filter_score_r(triples_batch, score_batch, all_ans)
+            filter_score_batch = filter_score_r(
+                triples_batch,
+                filter_input,
+                all_ans,
+            )
         else:
-            filter_score_batch = filter_score(triples_batch, score_batch, all_ans)
-        filter_rank.append(sort_and_rank(filter_score_batch, target))
+            filter_score_batch = filter_score(
+                triples_batch,
+                filter_input,
+                all_ans,
+            )
+
+        filter_rank.append(
+            sort_and_rank(
+                filter_score_batch,
+                target,
+            )
+        )
 
     rank = torch.cat(rank)
     filter_rank = torch.cat(filter_rank)
-    rank += 1 # change to 1-indexed
+
+    # Change to 1-indexed ranks.
+    rank += 1
     filter_rank += 1
-    mrr = torch.mean(1.0 / rank.float())
-    filter_mrr = torch.mean(1.0 / filter_rank.float())
-    return filter_mrr.item(), mrr.item(), rank, filter_rank
+
+    mrr = torch.mean(
+        1.0 / rank.float()
+    )
+    filter_mrr = torch.mean(
+        1.0 / filter_rank.float()
+    )
+
+    return (
+        filter_mrr.item(),
+        mrr.item(),
+        rank,
+        filter_rank,
+    )
 
 
 def stat_ranks(rank_list, method):
@@ -352,7 +511,6 @@ def slide_list(snapshots, k=1):
         print("ERROR: history length exceed the length of snapshot: {}>{}".format(k, len(snapshots)))
     for _ in tqdm(range(len(snapshots)-k+1)):
         yield snapshots[_: _+k]
-
 
 
 def load_data(dataset, bfs_level=3, relabel=False):
