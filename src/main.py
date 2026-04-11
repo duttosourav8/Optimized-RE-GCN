@@ -68,10 +68,6 @@ def build_hva_histories(data, num_rels):
 
 
 def build_graph_cache(snapshot_list, num_nodes, num_rels, gpu):
-    """
-    Cache temporal graphs once on CPU.
-    This preserves baseline semantics while removing repeated graph construction.
-    """
     return [build_sub_graph(num_nodes, num_rels, snap, False, gpu) for snap in snapshot_list]
 
 
