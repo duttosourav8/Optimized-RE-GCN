@@ -69,21 +69,33 @@ def build_topk_candidate_ids(base_scores: torch.Tensor, gold_ids: torch.Tensor, 
     k = min(topk_cands, base_scores.size(1))
     topk_ids = torch.topk(base_scores, k=k, dim=1).indices
 
-    rows = []
-    for i in range(topk_ids.size(0)):
-        row = topk_ids[i].tolist()
-        g = int(gold_ids[i].item())
-        if g not in row:
-            row[-1] = g
-        rows.append(row)
+    # Ensure gold is present without Python row loops.
+    gold_ids = gold_ids.view(-1, 1)
+    has_gold = topk_ids.eq(gold_ids).any(dim=1)
+    if not torch.all(has_gold):
+        topk_ids = topk_ids.clone()
+        missing_rows = (~has_gold).nonzero(as_tuple=False).view(-1)
+        topk_ids[missing_rows, -1] = gold_ids[missing_rows, 0]
+    return topk_ids
 
-    return torch.tensor(rows, dtype=torch.long, device=base_scores.device)
+
+def find_candidate_positions(candidate_ids: torch.Tensor, gold_ids: torch.Tensor) -> torch.Tensor:
+    matches = candidate_ids.eq(gold_ids.view(-1, 1))
+    if not torch.all(matches.any(dim=1)):
+        raise ValueError("Gold id missing from candidate list.")
+    return matches.to(dtype=torch.long).argmax(dim=1)
 
 
 def scatter_topk_back(full_scores: torch.Tensor, candidate_ids: torch.Tensor, adjusted_topk_scores: torch.Tensor):
     out = full_scores.clone()
     out.scatter_(1, candidate_ids, adjusted_topk_scores)
     return out
+
+
+def _as_python_rows(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu().tolist()
+    return np.asarray(x).tolist()
 
 
 def build_topk_history_features_dual(
@@ -93,66 +105,89 @@ def build_topk_history_features_dual(
     so_hist,
     ro_hist,
     device,
+    mode="dual_branch",
 ):
-    if torch.is_tensor(candidate_ids):
-        cand_np = candidate_ids.detach().cpu().numpy()
-    else:
-        cand_np = np.asarray(candidate_ids)
+    """
+    Builds exact + near branch features.
 
-    if torch.is_tensor(query_triples):
-        query_np = query_triples.detach().cpu().numpy()
-    else:
-        query_np = np.asarray(query_triples)
+    Supported modes:
+      - exact_only
+      - dual_branch
+      - exact
+      - near
+      - full
 
-    batch_size, k = cand_np.shape
+    The function returns all 9 tensors for compatibility, but only computes
+    the branches required by the active mode.
+    """
+    query_rows = _as_python_rows(query_triples)
+    cand_rows = _as_python_rows(candidate_ids)
 
-    seen_sr = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    dt_sr = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    freq_sr = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    batch_size = len(query_rows)
+    k = len(cand_rows[0]) if batch_size > 0 else 0
 
-    seen_so = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    dt_so = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    freq_so = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    need_exact = mode in {"exact_only", "dual_branch", "exact", "full"}
+    need_near = mode in {"dual_branch", "near", "full"}
 
-    seen_ro = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    dt_ro = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    freq_ro = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    seen_sr = np.zeros((batch_size, k), dtype=np.float32)
+    dt_sr = np.zeros((batch_size, k), dtype=np.float32)
+    freq_sr = np.zeros((batch_size, k), dtype=np.float32)
+
+    seen_so = np.zeros((batch_size, k), dtype=np.float32)
+    dt_so = np.zeros((batch_size, k), dtype=np.float32)
+    freq_so = np.zeros((batch_size, k), dtype=np.float32)
+
+    seen_ro = np.zeros((batch_size, k), dtype=np.float32)
+    dt_ro = np.zeros((batch_size, k), dtype=np.float32)
+    freq_ro = np.zeros((batch_size, k), dtype=np.float32)
 
     for i in range(batch_size):
-        s, r, _, t = map(int, query_np[i][:4])
+        s, r, _, t = map(int, query_rows[i][:4])
 
-        cand_map_sr = sr_hist.get((s, r), {})
-        cand_map_so = so_hist.get(s, {})
-        cand_map_ro = ro_hist.get(r, {})
+        cand_map_sr = sr_hist.get((s, r), {}) if need_exact else {}
+        cand_map_so = so_hist.get(s, {}) if need_near else {}
+        cand_map_ro = ro_hist.get(r, {}) if need_near else {}
 
-        for j, cand_o in enumerate(cand_np[i]):
+        for j, cand_o in enumerate(cand_rows[i]):
             cand_o = int(cand_o)
 
-            times_sr = cand_map_sr.get(cand_o, [])
-            if times_sr:
-                lt = last_time_before(times_sr, t)
-                if lt is not None:
-                    seen_sr[i, j] = 1.0
-                    dt_sr[i, j] = float(t - lt)
-                    freq_sr[i, j] = float(freq_before(times_sr, t))
+            if need_exact:
+                times_sr = cand_map_sr.get(cand_o, [])
+                if times_sr:
+                    lt = last_time_before(times_sr, t)
+                    if lt is not None:
+                        seen_sr[i, j] = 1.0
+                        dt_sr[i, j] = float(t - lt)
+                        freq_sr[i, j] = float(freq_before(times_sr, t))
 
-            times_so = cand_map_so.get(cand_o, [])
-            if times_so:
-                lt = last_time_before(times_so, t)
-                if lt is not None:
-                    seen_so[i, j] = 1.0
-                    dt_so[i, j] = float(t - lt)
-                    freq_so[i, j] = float(freq_before(times_so, t))
+            if need_near:
+                times_so = cand_map_so.get(cand_o, [])
+                if times_so:
+                    lt = last_time_before(times_so, t)
+                    if lt is not None:
+                        seen_so[i, j] = 1.0
+                        dt_so[i, j] = float(t - lt)
+                        freq_so[i, j] = float(freq_before(times_so, t))
 
-            times_ro = cand_map_ro.get(cand_o, [])
-            if times_ro:
-                lt = last_time_before(times_ro, t)
-                if lt is not None:
-                    seen_ro[i, j] = 1.0
-                    dt_ro[i, j] = float(t - lt)
-                    freq_ro[i, j] = float(freq_before(times_ro, t))
+                times_ro = cand_map_ro.get(cand_o, [])
+                if times_ro:
+                    lt = last_time_before(times_ro, t)
+                    if lt is not None:
+                        seen_ro[i, j] = 1.0
+                        dt_ro[i, j] = float(t - lt)
+                        freq_ro[i, j] = float(freq_before(times_ro, t))
 
-    return seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro
+    return (
+        torch.from_numpy(seen_sr).to(device),
+        torch.from_numpy(dt_sr).to(device),
+        torch.from_numpy(freq_sr).to(device),
+        torch.from_numpy(seen_so).to(device),
+        torch.from_numpy(dt_so).to(device),
+        torch.from_numpy(freq_so).to(device),
+        torch.from_numpy(seen_ro).to(device),
+        torch.from_numpy(dt_ro).to(device),
+        torch.from_numpy(freq_ro).to(device),
+    )
 
 
 def novelty_bucket_from_history(s, r, o, t, sr_hist, so_hist, ro_hist):
@@ -243,8 +278,7 @@ class HistoryValidityAdapter(nn.Module):
     def _normalize_freq(self, freq, seen):
         freq_feat = torch.log1p(torch.clamp(freq, min=0.0))
         freq_feat = freq_feat / (freq_feat.max(dim=1, keepdim=True).values + 1e-8)
-        freq_feat = freq_feat * seen
-        return freq_feat
+        return freq_feat * seen
 
     def _branch_exact(self, rel_ids, seen, dt, freq):
         lam = F.softplus(self.rel_lambda_sr(rel_ids)).squeeze(-1).unsqueeze(1)
